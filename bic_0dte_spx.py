@@ -1,13 +1,18 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║        BREAKEVEN IRON CONDOR (BIC) — 0DTE SPX AUTOMATED ALERT SYSTEM       ║
-║                    v3.2 | GitHub Actions Native                              ║
+║                    v3.3 | GitHub Actions Native                              ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  v3.2 additions over v3.1:                                                   ║
+║  v3.3 fixes:                                                                 ║
+║    ✅ Pre-flight check: abort entry if SPX already outside win zone          ║
+║    ✅ Immediate monitor run right after entry (no 12-min blind window)       ║
+║    ✅ run_monitor() accepts suppress_window_check for post-entry call        ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  v3.2 additions:                                                             ║
 ║    ✅ --monitor mode: brokerage-independent leg breach detection              ║
 ║    ✅ positions.json auto-written on every --entry run (strikes known)       ║
 ║    ✅ positions.json auto-cleared on --exit (matches hard-exit rule)         ║
-║    ✅ Monitor reads positions.json, fetches live Greeks via yfinance/BS      ║
+║    ✅ Monitor reads positions.json, fetches live Greeks via Tradier/BS       ║
 ║    ✅ Tiered alerts: 🔴 breach / ⚠️ warning / 🔇 silence                    ║
 ║    ✅ Telegram retry with exponential backoff (3 attempts)                   ║
 ║    ✅ Pipeline errors surfaced as Telegram alerts                            ║
@@ -51,7 +56,6 @@ log = logging.getLogger("BIC")
 ET  = ZoneInfo("America/New_York")
 PST = ZoneInfo("America/Los_Angeles")
 
-# Path to the active positions file — committed to repo root
 POSITIONS_FILE = "positions.json"
 
 
@@ -79,11 +83,11 @@ class Config:
     VIX_CAUTION_ABOVE = 22
 
     # Monitor breach thresholds
-    BREACH_DELTA      = 0.30    # 🔴 immediate action
-    BREACH_WARN_DELTA = 0.20    # ⚠️  early warning
-    MINS_BREACH_RED   = 15      # 🔴 if < this many mins to breach
-    MINS_BREACH_WARN  = 30      # ⚠️  if < this many mins to breach
-    SPX_1MIN_MOVE     = 0.20    # conservative SPX pts/min for time estimate
+    BREACH_DELTA      = 0.30
+    BREACH_WARN_DELTA = 0.20
+    MINS_BREACH_RED   = 15
+    MINS_BREACH_WARN  = 30
+    SPX_1MIN_MOVE     = 0.20
 
     # API endpoints
     TRADIER_BASE    = "https://api.tradier.com/v1"
@@ -94,44 +98,27 @@ cfg = Config()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# POSITIONS FILE  — written on entry, read by monitor, cleared on exit
+# POSITIONS FILE
 # ─────────────────────────────────────────────────────────────────────────────
 def save_positions(trade: dict, entry_num: int) -> None:
-    """
-    Persist the four short leg strikes from a BIC entry to positions.json.
-    Called immediately after a trade alert is sent so the monitor has them.
-
-    Structure written:
-    {
-        "date":      "2025-01-15",
-        "entry_num": 2,
-        "expiry":    "2025-01-15",
-        "legs": [
-            {"type": "put",  "short_strike": 5450, "long_strike": 5425,
-             "entry_delta": 0.07, "entry_credit": 65},
-            {"type": "call", "short_strike": 5600, "long_strike": 5625,
-             "entry_delta": 0.07, "entry_credit": 60}
-        ]
-    }
-    """
     payload = {
         "date":      date.today().isoformat(),
         "entry_num": entry_num,
         "expiry":    date.today().isoformat(),
         "legs": [
             {
-                "type":          "put",
-                "short_strike":  trade["put_short"],
-                "long_strike":   trade["put_long"],
-                "entry_delta":   trade["put_delta"],
-                "entry_credit":  trade["put_credit"],
+                "type":         "put",
+                "short_strike": trade["put_short"],
+                "long_strike":  trade["put_long"],
+                "entry_delta":  trade["put_delta"],
+                "entry_credit": trade["put_credit"],
             },
             {
-                "type":          "call",
-                "short_strike":  trade["call_short"],
-                "long_strike":   trade["call_long"],
-                "entry_delta":   trade["call_delta"],
-                "entry_credit":  trade["call_credit"],
+                "type":         "call",
+                "short_strike": trade["call_short"],
+                "long_strike":  trade["call_long"],
+                "entry_delta":  trade["call_delta"],
+                "entry_credit": trade["call_credit"],
             },
         ],
     }
@@ -141,10 +128,6 @@ def save_positions(trade: dict, entry_num: int) -> None:
 
 
 def load_positions() -> Optional[dict]:
-    """
-    Load positions.json. Returns None if file missing, empty, or stale (not today).
-    Stale check prevents yesterday's positions from being monitored next morning.
-    """
     if not os.path.exists(POSITIONS_FILE):
         return None
     try:
@@ -152,7 +135,6 @@ def load_positions() -> Optional[dict]:
             data = json.load(f)
         if not data.get("legs"):
             return None
-        # Stale guard — only monitor today's positions
         if data.get("date") != date.today().isoformat():
             log.info("positions.json is from a previous day — ignoring")
             return None
@@ -163,10 +145,9 @@ def load_positions() -> Optional[dict]:
 
 
 def clear_positions() -> None:
-    """Write an empty positions file. Called by --exit."""
     with open(POSITIONS_FILE, "w") as f:
         json.dump({"date": date.today().isoformat(), "legs": [], "cleared": "exit"}, f, indent=2)
-    log.info("positions.json cleared — all legs released from monitor")
+    log.info("positions.json cleared")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -251,9 +232,8 @@ class MarketData:
         Fetch live Greeks for a known strike+type.
         Primary:  Tradier options chain (if key present)
         Fallback: Black-Scholes using live SPX + VIX as IV proxy
-        Always returns a dict — never None — so monitor never crashes on missing data.
+        Always returns a dict — never None.
         """
-        # ── Try Tradier first ────────────────────────────────────────────────
         if cfg.TRADIER_KEY:
             try:
                 r = requests.get(
@@ -268,7 +248,7 @@ class MarketData:
                 for opt in opts:
                     if (opt.get("option_type", "").lower() == opt_type and
                             abs(float(opt.get("strike", -1)) - strike) < 0.5):
-                        g = opt.get("greeks") or {}
+                        g   = opt.get("greeks") or {}
                         bid = float(opt.get("bid") or 0)
                         ask = float(opt.get("ask") or 0)
                         return {
@@ -280,7 +260,7 @@ class MarketData:
             except Exception as e:
                 log.warning(f"Tradier greeks failed for {strike}{opt_type[0].upper()}: {e}")
 
-        # ── Black-Scholes fallback ───────────────────────────────────────────
+        # Black-Scholes fallback
         T     = time_to_expiry_years()
         sigma = (vix or 20.0) / 100
         r_f   = cfg.RISK_FREE_RATE
@@ -290,11 +270,10 @@ class MarketData:
         if T > 0 and sigma > 0:
             d1    = _d1(S, K, T, r_f, sigma)
             delta = float(norm.cdf(d1) if opt_type == "call" else norm.cdf(d1) - 1)
-            # Gamma is identical for calls and puts (BS)
             gamma = float(norm.pdf(d1) / (S * sigma * math.sqrt(T)))
             price = bs_price(S, K, T, r_f, sigma, opt_type)
         else:
-            delta = -1.0 if opt_type == "put" else 1.0  # deep ITM at expiry
+            delta = -1.0 if opt_type == "put" else 1.0
             gamma = 0.0
             price = max(0.0, S - K if opt_type == "call" else K - S)
 
@@ -682,6 +661,18 @@ class Telegram:
         ]
         return "\n".join(lines)
 
+    def aborted_msg(self, reason: str, spx: float, put_short: float,
+                    call_short: float, entry_num: int) -> str:
+        return (
+            f"<b>🚫 BIC ENTRY #{entry_num} ABORTED — {now_pst().strftime('%H:%M')} PST</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            f"{reason}\n"
+            f"  SPX now:   <b>{spx}</b>\n"
+            f"  Win zone:  {put_short} – {call_short}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "<i>Legs NOT registered — waiting for next window</i>"
+        )
+
     def skip_msg(self, reason: str, regime: str, spx, vix) -> str:
         re = {"GO":"🟢","CAUTION":"🟡","SKIP":"🔴"}.get(regime,"⚪")
         return (f"<b>⛔ BIC SKIP  —  {now_pst().strftime('%H:%M')} PST</b>\n"
@@ -787,31 +778,56 @@ class BICSystem:
             self.tg.send(self.tg.no_setup_msg(spx, vix, gex["regime"]))
             return
 
-        # ── Auto-register legs for monitor ───────────────────────────────────
-        save_positions(trade, entry_num)
+        # ── v3.3 Pre-flight: abort if SPX already outside the win zone ────────
+        # This catches the case where the cron fires but SPX has moved since
+        # the legs were calculated (e.g. news spike between alert and entry).
+        if spx > trade["call_short"]:
+            self.tg.send(self.tg.aborted_msg(
+                f"SPX <b>{spx}</b> is above call short <b>{trade['call_short']}</b> — "
+                "call side already ITM.",
+                spx, trade["put_short"], trade["call_short"], entry_num
+            ))
+            return
 
+        if spx < trade["put_short"]:
+            self.tg.send(self.tg.aborted_msg(
+                f"SPX <b>{spx}</b> is below put short <b>{trade['put_short']}</b> — "
+                "put side already ITM.",
+                spx, trade["put_short"], trade["call_short"], entry_num
+            ))
+            return
+
+        # ── Register legs + send trade alert ─────────────────────────────────
+        save_positions(trade, entry_num)
         verdict = self.ai.analyze_trade(market, gex, trade, entry_num)
         self.tg.send(self.tg.trade_msg(market, gex, trade, verdict, entry_num))
 
+        # ── v3.3 Immediate post-entry monitor check ───────────────────────────
+        # Eliminates the 12-min blind window between entry and first monitor run.
+        log.info("Running immediate post-entry monitor check...")
+        self.run_monitor(suppress_window_check=True)
+
     def run_exit(self):
         log.info("=== EXIT REMINDER ===")
-        # Clear positions first — monitor will go quiet immediately after this
         clear_positions()
         if is_market_open():
             self.tg.send(self.tg.exit_msg())
         else:
             log.info("Market closed — exit reminder suppressed, positions cleared")
 
-    def run_monitor(self):
+    def run_monitor(self, suppress_window_check: bool = False):
         """
         Brokerage-independent leg breach monitor.
         Reads strikes from positions.json (written at entry time).
         Fetches live Greeks via Tradier if available, Black-Scholes otherwise.
         Fires tiered Telegram alerts — silent if all legs are safe.
+
+        suppress_window_check=True: skip the trading-hours guard.
+        Used for the immediate post-entry check inside run_entry().
         """
         log.info("=== LEG MONITOR ===")
 
-        if not is_monitor_window():
+        if not suppress_window_check and not is_monitor_window():
             log.info("Outside monitor window — skipping")
             return
 
@@ -835,35 +851,34 @@ class BICSystem:
         warning_alerts = []
 
         for leg in legs:
-            opt_type     = leg["type"]           # "put" or "call"
+            opt_type     = leg["type"]
             short_strike = float(leg["short_strike"])
-            entry_delta  = float(leg.get("entry_delta", 0.07))
 
             greeks = self.md.get_live_greeks_for_strike(
                 short_strike, opt_type, expiry, spx, vix
             )
 
-            live_delta  = abs(greeks["delta"])
-            live_gamma  = abs(greeks["gamma"])
-            mid         = greeks["mid"]
-            source      = greeks["source"]
-            label       = f"{int(short_strike)}{opt_type[0].upper()}"
+            live_delta = abs(greeks["delta"])
+            live_gamma = abs(greeks["gamma"])
+            mid        = greeks["mid"]
+            source     = greeks["source"]
+            label      = f"{int(short_strike)}{opt_type[0].upper()}"
 
             log.info(f"{label} | Δ={live_delta:.3f} γ={live_gamma:.5f} "
                      f"mid=${mid:.2f} [{source}]")
 
-            # ── Time-to-breach estimate ───────────────────────────────────────
+            # Time-to-breach estimate
             if live_gamma > 0:
                 delta_headroom = cfg.BREACH_DELTA - live_delta
                 mins_to_breach = (delta_headroom / live_gamma) / cfg.SPX_1MIN_MOVE
             else:
                 mins_to_breach = 999.0
 
-            # ── Tier classification ───────────────────────────────────────────
+            # Tier classification
             already_breached = live_delta >= cfg.BREACH_DELTA
             near_breach      = mins_to_breach <= cfg.MINS_BREACH_RED
-            early_warn       = live_delta >= cfg.BREACH_WARN_DELTA or \
-                               mins_to_breach <= cfg.MINS_BREACH_WARN
+            early_warn       = (live_delta >= cfg.BREACH_WARN_DELTA or
+                                mins_to_breach <= cfg.MINS_BREACH_WARN)
 
             if already_breached:
                 breach_alerts.append(
@@ -884,7 +899,6 @@ class BICSystem:
                     f"~{mins_to_breach:.0f} min  [{source}]"
                 )
 
-        # ── Send (breach takes priority; silence if all clear) ────────────────
         if breach_alerts:
             self.tg.send(self.tg.monitor_breach_msg(breach_alerts, spx, time_str))
         elif warning_alerts:
@@ -913,21 +927,20 @@ class BICSystem:
             )
             return
 
-        # Test also writes positions.json so monitor can be tested immediately after
         save_positions(trade, 1)
-
         verdict = self.ai.analyze_trade(market, gex, trade, 1)
         msg     = "<b>[TEST RUN — not a live recommendation]</b>\n" + \
                   self.tg.trade_msg(market, gex, trade, verdict, 1)
         self.tg.send(msg)
-        log.info("Test complete — positions.json written, run --monitor to verify")
+        log.info("Test complete — positions.json written, running monitor check...")
+        self.run_monitor(suppress_window_check=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="BIC 0DTE SPX Alert System v3.2")
+    parser = argparse.ArgumentParser(description="BIC 0DTE SPX Alert System v3.3")
     group  = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--morning", action="store_true",   help="Morning regime scan")
     group.add_argument("--entry",   type=int, metavar="N", help="Entry scan #N (1-5)")
