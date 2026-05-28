@@ -8,9 +8,8 @@ on:
     - cron: '35 17 * * 1-5'           # 09:35 PST — entry #3
     - cron: '35 18 * * 1-5'           # 10:35 PST — entry #4
     - cron: '35 19 * * 1-5'           # 11:35 PST — entry #5
-    - cron: '30 22 * * 1-5'           # 14:30 PST — exit reminder
+    - cron: '30 22 * * 1-5'           # 14:30 PST — exit + clear positions
     # Leg monitor: every 12 min, 07:30–14:30 PST (15:30–22:30 UTC)
-    # 12-min cadence absorbs GitHub's ~5 min scheduler drift
     - cron: '0,12,24,36,48 15-22 * * 1-5'
 
   workflow_dispatch:
@@ -23,20 +22,26 @@ on:
         options: [test, morning, entry1, entry2, entry3, entry4, entry5, exit, monitor]
 
 jobs:
+  # ── Main alert job (morning / entry / exit / test) ─────────────────────────
   bic-alert:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     concurrency:
       group: bic-alert-${{ github.ref }}
       cancel-in-progress: false
+    permissions:
+      contents: write       # needed to commit positions.json after entry
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: 'pip'
+
       - name: Install dependencies
         run: pip install -r requirements.txt
+
       - name: Run BIC alert
         env:
           TRADIER_API_KEY:    ${{ secrets.TRADIER_API_KEY }}
@@ -95,22 +100,41 @@ jobs:
             fi
           fi
 
+      # Commit positions.json back to repo so the monitor job can read it.
+      # Only runs if the file was written/changed (entry or test runs).
+      # Uses [skip ci] so this commit does NOT re-trigger the workflow.
+      - name: Commit positions.json if updated
+        run: |
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
+          git add positions.json
+          if git diff --cached --quiet; then
+            echo "positions.json unchanged — nothing to commit"
+          else
+            git commit -m "chore: update positions.json [skip ci]"
+            git push
+            echo "positions.json committed"
+          fi
+
+  # ── Leg monitor job (every 12 min, schedule only) ──────────────────────────
   leg-monitor:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Only run on schedule (not manual dispatch — use bic-alert job with mode=monitor for that)
     if: github.event_name == 'schedule'
     concurrency:
       group: leg-monitor-${{ github.ref }}
-      cancel-in-progress: true      # if a prior monitor run is still going, skip it
+      cancel-in-progress: true       # skip queued run if prior one still running
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4    # reads positions.json committed by bic-alert
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: 'pip'
+
       - name: Install dependencies
         run: pip install -r requirements.txt
+
       - name: Monitor open legs for breach
         env:
           TRADIER_API_KEY:    ${{ secrets.TRADIER_API_KEY }}
@@ -121,7 +145,7 @@ jobs:
           echo "UTC: $(date -u '+%H:%M')"
           echo "ET:  $(TZ='America/New_York' date '+%H:%M')"
           CRON_HOUR=$(date -u +%H)
-          # Only run monitor during active trading hours (15–22 UTC = 07:00–14:30 PST)
+          # Active trading hours only: 15–22 UTC = 07:00–14:30 PST
           if [ "$CRON_HOUR" -ge "15" ] && [ "$CRON_HOUR" -le "22" ]; then
             echo "Running: leg monitor"
             python bic_0dte_spx.py --monitor
@@ -129,6 +153,7 @@ jobs:
             echo "Outside trading hours (UTC $CRON_HOUR) — skipping monitor"
           fi
 
+  # ── Keep-alive (prevents GitHub disabling the workflow after 60 days) ──────
   keep-alive:
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule'
