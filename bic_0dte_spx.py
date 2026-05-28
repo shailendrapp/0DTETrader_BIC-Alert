@@ -1,13 +1,16 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║        BREAKEVEN IRON CONDOR (BIC) — 0DTE SPX AUTOMATED ALERT SYSTEM       ║
-║                    v3.1 | GitHub Actions Native                              ║
+║                    v3.2 | GitHub Actions Native                              ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  v3.1 additions:                                                             ║
-║    ✅ --monitor mode: leg breach detection every ~12 min                     ║
-║    ✅ Live delta/gamma fetched from Tradier (not entry delta)                ║
+║  v3.2 additions over v3.1:                                                   ║
+║    ✅ --monitor mode: brokerage-independent leg breach detection              ║
+║    ✅ positions.json auto-written on every --entry run (strikes known)       ║
+║    ✅ positions.json auto-cleared on --exit (matches hard-exit rule)         ║
+║    ✅ Monitor reads positions.json, fetches live Greeks via yfinance/BS      ║
+║    ✅ Tiered alerts: 🔴 breach / ⚠️ warning / 🔇 silence                    ║
 ║    ✅ Telegram retry with exponential backoff (3 attempts)                   ║
-║    ✅ Pipeline error alerts — silent API failures now surfaced               ║
+║    ✅ Pipeline errors surfaced as Telegram alerts                            ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  Run modes:                                                                  ║
 ║    python bic_0dte_spx.py --morning      (06:30 PST cron)                   ║
@@ -16,14 +19,14 @@
 ║    python bic_0dte_spx.py --entry 3      (entry #3 — 09:35 PST)             ║
 ║    python bic_0dte_spx.py --entry 4      (entry #4 — 10:35 PST)             ║
 ║    python bic_0dte_spx.py --entry 5      (entry #5 — 11:35 PST)             ║
-║    python bic_0dte_spx.py --exit         (14:30 PST cron)                   ║
+║    python bic_0dte_spx.py --exit         (14:30 PST cron — clears positions)║
 ║    python bic_0dte_spx.py --monitor      (every 12 min — leg breach watch)  ║
 ║    python bic_0dte_spx.py --test         (manual test, bypasses time guards) ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
 # ── Standard library ──────────────────────────────────────────────────────────
-import os, math, logging, argparse, time
+import os, math, json, logging, argparse, time
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional
@@ -48,12 +51,14 @@ log = logging.getLogger("BIC")
 ET  = ZoneInfo("America/New_York")
 PST = ZoneInfo("America/Los_Angeles")
 
+# Path to the active positions file — committed to repo root
+POSITIONS_FILE = "positions.json"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 class Config:
-    # All keys read from environment variables — set as GitHub Secrets
     TRADIER_KEY      = "".join(os.getenv("TRADIER_API_KEY",    "").split())
     FLASHALPHA_KEY   = "".join(os.getenv("FLASHALPHA_API_KEY", "").split())
     ANTHROPIC_KEY    = "".join(os.getenv("ANTHROPIC_API_KEY",  "").split())
@@ -66,16 +71,18 @@ class Config:
     WING_WIDTH_MIN    = 25
     WING_WIDTH_MAX    = 35
     MIN_CREDIT_SIDE   = 50
-    STOP_BUFFER       = 5       # total credit + $5 = stop per side
+    STOP_BUFFER       = 5
     PROFIT_TAKE_PCT   = 0.50
 
     # Risk controls
     VIX_SKIP_ABOVE    = 30
     VIX_CAUTION_ABOVE = 22
 
-    # Monitor — breach alert thresholds
-    BREACH_DELTA      = 0.30    # alert when live |delta| approaches this
-    BREACH_WARN_DELTA = 0.20    # early warning level
+    # Monitor breach thresholds
+    BREACH_DELTA      = 0.30    # 🔴 immediate action
+    BREACH_WARN_DELTA = 0.20    # ⚠️  early warning
+    MINS_BREACH_RED   = 15      # 🔴 if < this many mins to breach
+    MINS_BREACH_WARN  = 30      # ⚠️  if < this many mins to breach
     SPX_1MIN_MOVE     = 0.20    # conservative SPX pts/min for time estimate
 
     # API endpoints
@@ -87,7 +94,83 @@ cfg = Config()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MARKET HOURS  — all comparisons done in ET; GA runner is always UTC
+# POSITIONS FILE  — written on entry, read by monitor, cleared on exit
+# ─────────────────────────────────────────────────────────────────────────────
+def save_positions(trade: dict, entry_num: int) -> None:
+    """
+    Persist the four short leg strikes from a BIC entry to positions.json.
+    Called immediately after a trade alert is sent so the monitor has them.
+
+    Structure written:
+    {
+        "date":      "2025-01-15",
+        "entry_num": 2,
+        "expiry":    "2025-01-15",
+        "legs": [
+            {"type": "put",  "short_strike": 5450, "long_strike": 5425,
+             "entry_delta": 0.07, "entry_credit": 65},
+            {"type": "call", "short_strike": 5600, "long_strike": 5625,
+             "entry_delta": 0.07, "entry_credit": 60}
+        ]
+    }
+    """
+    payload = {
+        "date":      date.today().isoformat(),
+        "entry_num": entry_num,
+        "expiry":    date.today().isoformat(),
+        "legs": [
+            {
+                "type":          "put",
+                "short_strike":  trade["put_short"],
+                "long_strike":   trade["put_long"],
+                "entry_delta":   trade["put_delta"],
+                "entry_credit":  trade["put_credit"],
+            },
+            {
+                "type":          "call",
+                "short_strike":  trade["call_short"],
+                "long_strike":   trade["call_long"],
+                "entry_delta":   trade["call_delta"],
+                "entry_credit":  trade["call_credit"],
+            },
+        ],
+    }
+    with open(POSITIONS_FILE, "w") as f:
+        json.dump(payload, f, indent=2)
+    log.info(f"positions.json written — {trade['put_short']}P / {trade['call_short']}C")
+
+
+def load_positions() -> Optional[dict]:
+    """
+    Load positions.json. Returns None if file missing, empty, or stale (not today).
+    Stale check prevents yesterday's positions from being monitored next morning.
+    """
+    if not os.path.exists(POSITIONS_FILE):
+        return None
+    try:
+        with open(POSITIONS_FILE) as f:
+            data = json.load(f)
+        if not data.get("legs"):
+            return None
+        # Stale guard — only monitor today's positions
+        if data.get("date") != date.today().isoformat():
+            log.info("positions.json is from a previous day — ignoring")
+            return None
+        return data
+    except Exception as e:
+        log.error(f"positions.json read error: {e}")
+        return None
+
+
+def clear_positions() -> None:
+    """Write an empty positions file. Called by --exit."""
+    with open(POSITIONS_FILE, "w") as f:
+        json.dump({"date": date.today().isoformat(), "legs": [], "cleared": "exit"}, f, indent=2)
+    log.info("positions.json cleared — all legs released from monitor")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MARKET HOURS
 # ─────────────────────────────────────────────────────────────────────────────
 def now_et() -> datetime:
     return datetime.now(ET)
@@ -103,13 +186,11 @@ def is_market_open() -> bool:
            n.replace(hour=16, minute=15, second=0, microsecond=0)
 
 def is_entry_window() -> bool:
-    """Valid BIC entry: 9:35 AM ET – 2:30 PM ET"""
     n = now_et()
     return n.replace(hour=9, minute=35, second=0, microsecond=0) <= n <= \
            n.replace(hour=14, minute=30, second=0, microsecond=0)
 
 def is_monitor_window() -> bool:
-    """Monitor active: 9:35 AM ET – 2:30 PM ET (same as entry window)"""
     return is_entry_window()
 
 
@@ -158,105 +239,71 @@ class MarketData:
             return opts or None
         except requests.HTTPError as e:
             code = e.response.status_code
-            log.error(f"Tradier HTTP {code} — {'bad key' if code==401 else 'no RT access' if code==403 else str(e)}")
+            log.error(f"Tradier HTTP {code}")
             return None
         except Exception as e:
             log.error(f"Tradier error: {e}")
             return None
 
-    def get_open_positions(self) -> list:
+    def get_live_greeks_for_strike(self, strike: float, opt_type: str,
+                                   expiry: str, spx: float, vix: float) -> dict:
         """
-        Fetch open SPX 0DTE option positions from Tradier.
-        Returns list of dicts with symbol, option_type, strike, quantity, cost_basis.
-        Only returns today's expiry positions.
+        Fetch live Greeks for a known strike+type.
+        Primary:  Tradier options chain (if key present)
+        Fallback: Black-Scholes using live SPX + VIX as IV proxy
+        Always returns a dict — never None — so monitor never crashes on missing data.
         """
-        if not cfg.TRADIER_KEY:
-            log.warning("No TRADIER_API_KEY — cannot fetch positions for monitor")
-            return []
-        try:
-            r = requests.get(
-                f"{cfg.TRADIER_BASE}/accounts/{self._get_account_id()}/positions",
-                headers={"Authorization": f"Bearer {cfg.TRADIER_KEY}",
-                         "Accept": "application/json"},
-                timeout=12,
-            )
-            r.raise_for_status()
-            raw = r.json().get("positions", {}).get("position", [])
-            if isinstance(raw, dict):
-                raw = [raw]  # single position comes back as dict, not list
+        # ── Try Tradier first ────────────────────────────────────────────────
+        if cfg.TRADIER_KEY:
+            try:
+                r = requests.get(
+                    f"{cfg.TRADIER_BASE}/markets/options/chains",
+                    headers={"Authorization": f"Bearer {cfg.TRADIER_KEY}",
+                             "Accept": "application/json"},
+                    params={"symbol": "SPX", "expiration": expiry, "greeks": "true"},
+                    timeout=12,
+                )
+                r.raise_for_status()
+                opts = r.json().get("options", {}).get("option", [])
+                for opt in opts:
+                    if (opt.get("option_type", "").lower() == opt_type and
+                            abs(float(opt.get("strike", -1)) - strike) < 0.5):
+                        g = opt.get("greeks") or {}
+                        bid = float(opt.get("bid") or 0)
+                        ask = float(opt.get("ask") or 0)
+                        return {
+                            "delta":  float(g.get("delta") or 0),
+                            "gamma":  float(g.get("gamma") or 0),
+                            "source": "tradier",
+                            "mid":    round((bid + ask) / 2, 2) if bid and ask else 0.0,
+                        }
+            except Exception as e:
+                log.warning(f"Tradier greeks failed for {strike}{opt_type[0].upper()}: {e}")
 
-            today_exp = self.get_today_expiry().replace("-", "")  # YYYYMMDD
-            positions = []
-            for p in raw:
-                sym = p.get("symbol", "")
-                # SPX option symbols contain the expiry date: SPXYYYYMMDD
-                if "SPX" in sym and today_exp in sym:
-                    qty = p.get("quantity", 0)
-                    if qty == 0:
-                        continue
-                    positions.append({
-                        "symbol":      sym,
-                        "quantity":    qty,
-                        "cost_basis":  p.get("cost_basis", 0),
-                    })
-            log.info(f"Open 0DTE positions: {len(positions)}")
-            return positions
-        except Exception as e:
-            log.error(f"Position fetch error: {e}")
-            return []
+        # ── Black-Scholes fallback ───────────────────────────────────────────
+        T     = time_to_expiry_years()
+        sigma = (vix or 20.0) / 100
+        r_f   = cfg.RISK_FREE_RATE
+        S     = spx or 5500.0
+        K     = strike
 
-    def _get_account_id(self) -> str:
-        """Fetch Tradier account ID dynamically."""
-        try:
-            r = requests.get(
-                f"{cfg.TRADIER_BASE}/user/profile",
-                headers={"Authorization": f"Bearer {cfg.TRADIER_KEY}",
-                         "Accept": "application/json"},
-                timeout=10,
-            )
-            r.raise_for_status()
-            accounts = r.json().get("profile", {}).get("account", [])
-            if isinstance(accounts, dict):
-                accounts = [accounts]
-            return str(accounts[0].get("account_number", ""))
-        except Exception as e:
-            log.error(f"Account ID fetch error: {e}")
-            return ""
+        if T > 0 and sigma > 0:
+            d1    = _d1(S, K, T, r_f, sigma)
+            delta = float(norm.cdf(d1) if opt_type == "call" else norm.cdf(d1) - 1)
+            # Gamma is identical for calls and puts (BS)
+            gamma = float(norm.pdf(d1) / (S * sigma * math.sqrt(T)))
+            price = bs_price(S, K, T, r_f, sigma, opt_type)
+        else:
+            delta = -1.0 if opt_type == "put" else 1.0  # deep ITM at expiry
+            gamma = 0.0
+            price = max(0.0, S - K if opt_type == "call" else K - S)
 
-    def get_live_greeks(self, symbol: str, expiry: str) -> Optional[dict]:
-        """
-        Fetch live Greeks for a specific option symbol from Tradier.
-        Returns dict with delta, gamma, theta, vega, iv — or None on failure.
-        """
-        if not cfg.TRADIER_KEY:
-            return None
-        try:
-            r = requests.get(
-                f"{cfg.TRADIER_BASE}/markets/options/chains",
-                headers={"Authorization": f"Bearer {cfg.TRADIER_KEY}",
-                         "Accept": "application/json"},
-                params={"symbol": "SPX", "expiration": expiry, "greeks": "true"},
-                timeout=12,
-            )
-            r.raise_for_status()
-            opts = r.json().get("options", {}).get("option", [])
-            for opt in opts:
-                if opt.get("symbol") == symbol:
-                    g = opt.get("greeks") or {}
-                    return {
-                        "delta": float(g.get("delta") or 0),
-                        "gamma": float(g.get("gamma") or 0),
-                        "theta": float(g.get("theta") or 0),
-                        "vega":  float(g.get("vega")  or 0),
-                        "iv":    float(g.get("mid_iv") or g.get("smv_vol") or 0),
-                        "bid":   float(opt.get("bid")  or 0),
-                        "ask":   float(opt.get("ask")  or 0),
-                    }
-            log.warning(f"Symbol {symbol} not found in chain")
-            return None
-        except Exception as e:
-            log.error(f"Greeks fetch error for {symbol}: {e}")
-            return None
+        return {
+            "delta":  round(delta, 4),
+            "gamma":  round(gamma, 6),
+            "source": "black-scholes",
+            "mid":    round(price, 2),
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -347,7 +394,7 @@ class BICSelector:
         r     = cfg.RISK_FREE_RATE
 
         if T <= 0:
-            log.warning("Time to expiry is zero — no trade possible (outside market hours?)")
+            log.warning("Time to expiry is zero — no trade possible")
             return None
 
         wing = cfg.WING_WIDTH_MAX if vix > cfg.VIX_CAUTION_ABOVE else cfg.WING_WIDTH_MIN
@@ -532,7 +579,7 @@ class ClaudeAnalyst:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TELEGRAM  — with retry + backoff
+# TELEGRAM  — with retry + exponential backoff
 # ─────────────────────────────────────────────────────────────────────────────
 class Telegram:
 
@@ -563,8 +610,7 @@ class Telegram:
                 log.error(f"Telegram attempt {attempt+1} failed: {e}")
                 if attempt < retries - 1:
                     time.sleep(2 ** attempt)
-        # All retries exhausted — at minimum print so GitHub Actions log captures it
-        log.error(f"Telegram FAILED after {retries} attempts")
+        log.error(f"Telegram FAILED after {retries} attempts — printing to stdout")
         print(text)
         return False
 
@@ -589,10 +635,10 @@ class Telegram:
 
     def trade_msg(self, market: dict, gex: dict, trade: dict,
                   verdict: str, entry_num: int) -> str:
-        re    = {"GO": "🟢", "CAUTION": "🟡", "SKIP": "🔴"}.get(gex.get("regime","?"), "⚪")
-        ve    = "✅" if "GO ✅" in verdict else ("⏳" if "WAIT" in verdict else "❌")
+        re     = {"GO": "🟢", "CAUTION": "🟡", "SKIP": "🔴"}.get(gex.get("regime","?"), "⚪")
+        ve     = "✅" if "GO ✅" in verdict else ("⏳" if "WAIT" in verdict else "❌")
         stop_c = trade["stop_per_side"] / 100
-        lines = [
+        lines  = [
             f"<b>🎯 BIC ENTRY #{entry_num} {ve}  —  "
             f"{now_pst().strftime('%H:%M')} PST / {now_et().strftime('%H:%M')} ET</b>",
             "━━━━━━━━━━━━━━━━━━━━",
@@ -632,6 +678,7 @@ class Telegram:
             "━━━━━━━━━━━━━━━━━━━━",
             f"<i>Wings: {trade['wing_used']}pt  |  Imbalance: {trade['imbalance_pct']}%  |  "
             f"Hard exit: 14:30 PST</i>",
+            "<i>📍 Legs registered — monitor active every 12 min</i>",
         ]
         return "\n".join(lines)
 
@@ -655,17 +702,17 @@ class Telegram:
                 "Use market orders — do not wait for fills.\n"
                 "Gamma is extreme in the final 90 minutes.\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
-                "<i>Next alert: tomorrow 06:30 PST</i>")
+                "<i>Leg monitor deactivated — positions cleared</i>")
 
     def monitor_breach_msg(self, alerts: list, spx: float, time_str: str) -> str:
         lines = [
-            f"<b>🚨 BIC LEG MONITOR — {time_str}</b>",
+            f"<b>🚨 BIC LEG BREACH — {time_str}</b>",
             f"SPX: <b>{spx}</b>",
             "━━━━━━━━━━━━━━━━━━━━",
+        ] + alerts + [
+            "━━━━━━━━━━━━━━━━━━━━",
+            "<i>Close threatened leg(s) — do not wait for stop fill</i>",
         ]
-        lines += alerts
-        lines += ["━━━━━━━━━━━━━━━━━━━━",
-                  "<i>Check positions — consider closing threatened leg(s)</i>"]
         return "\n".join(lines)
 
     def monitor_warn_msg(self, warnings: list, spx: float, time_str: str) -> str:
@@ -673,16 +720,15 @@ class Telegram:
             f"<b>⚠️ BIC LEG WARNING — {time_str}</b>",
             f"SPX: <b>{spx}</b>",
             "━━━━━━━━━━━━━━━━━━━━",
+        ] + warnings + [
+            "━━━━━━━━━━━━━━━━━━━━",
+            "<i>Watch closely — next check in ~12 min</i>",
         ]
-        lines += warnings
-        lines += ["━━━━━━━━━━━━━━━━━━━━",
-                  "<i>Monitor closely — no action required yet</i>"]
         return "\n".join(lines)
 
     def pipeline_error_msg(self, error: str) -> str:
         return (f"<b>🔴 BIC PIPELINE ERROR — {now_pst().strftime('%H:%M')} PST</b>\n"
-                f"{error}\n"
-                "<i>Check GitHub Actions logs</i>")
+                f"{error}\n<i>Check GitHub Actions logs</i>")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -708,7 +754,7 @@ class BICSystem:
         log.info(f"=== ENTRY SCAN #{entry_num} ===")
 
         if not force and not is_entry_window():
-            log.info("Outside entry window — cron fired outside valid window")
+            log.info("Outside entry window — skipping")
             return
 
         market = self.md.get_spx_vix()
@@ -721,7 +767,7 @@ class BICSystem:
 
         if vix > cfg.VIX_SKIP_ABOVE:
             self.tg.send(self.tg.skip_msg(
-                f"VIX {vix:.1f} exceeds skip threshold {cfg.VIX_SKIP_ABOVE}. No trades today.",
+                f"VIX {vix:.1f} exceeds skip threshold {cfg.VIX_SKIP_ABOVE}.",
                 "SKIP", spx, vix))
             return
 
@@ -729,7 +775,7 @@ class BICSystem:
 
         if gex["regime"] == "SKIP":
             self.tg.send(self.tg.skip_msg(
-                "Negative GEX regime — dealers amplify moves. Stand aside this window.",
+                "Negative GEX regime — stand aside this window.",
                 "SKIP", spx, vix))
             return
 
@@ -741,24 +787,27 @@ class BICSystem:
             self.tg.send(self.tg.no_setup_msg(spx, vix, gex["regime"]))
             return
 
+        # ── Auto-register legs for monitor ───────────────────────────────────
+        save_positions(trade, entry_num)
+
         verdict = self.ai.analyze_trade(market, gex, trade, entry_num)
         self.tg.send(self.tg.trade_msg(market, gex, trade, verdict, entry_num))
 
     def run_exit(self):
         log.info("=== EXIT REMINDER ===")
+        # Clear positions first — monitor will go quiet immediately after this
+        clear_positions()
         if is_market_open():
             self.tg.send(self.tg.exit_msg())
         else:
-            log.info("Market closed — exit reminder suppressed")
+            log.info("Market closed — exit reminder suppressed, positions cleared")
 
     def run_monitor(self):
         """
-        Leg breach monitor — called every ~12 min by the leg-monitor GA job.
-        Fetches all open 0DTE SPX positions, checks live delta on each short leg,
-        and fires tiered Telegram alerts:
-          🚨 BREACH  — live |delta| >= BREACH_DELTA (0.30) OR already ITM
-          ⚠️  WARNING — live |delta| >= BREACH_WARN_DELTA (0.20) OR < 15 min to breach
-        Exits silently if no open positions or outside trading hours.
+        Brokerage-independent leg breach monitor.
+        Reads strikes from positions.json (written at entry time).
+        Fetches live Greeks via Tradier if available, Black-Scholes otherwise.
+        Fires tiered Telegram alerts — silent if all legs are safe.
         """
         log.info("=== LEG MONITOR ===")
 
@@ -766,107 +815,84 @@ class BICSystem:
             log.info("Outside monitor window — skipping")
             return
 
-        # Fetch open positions — exit quietly if none
-        try:
-            positions = self.md.get_open_positions()
-        except Exception as e:
-            self.tg.send(self.tg.pipeline_error_msg(f"Position fetch failed: {e}"))
-            raise
-
+        positions = load_positions()
         if not positions:
-            log.info("No open 0DTE positions — monitor quiet")
+            log.info("No active positions today — monitor quiet")
             return
 
-        # Fetch live SPX price for context
-        market = self.md.get_spx_vix()
-        spx    = market.get("spx") or 0.0
-        vix    = market.get("vix") or 20.0
-        expiry = self.md.get_today_expiry()
+        legs = positions.get("legs", [])
+        if not legs:
+            log.info("Positions file has no legs — monitor quiet")
+            return
+
+        market   = self.md.get_spx_vix()
+        spx      = market.get("spx") or 0.0
+        vix      = market.get("vix") or 20.0
+        expiry   = self.md.get_today_expiry()
         time_str = f"{now_pst().strftime('%H:%M')} PST / {now_et().strftime('%H:%M')} ET"
 
-        breach_alerts  = []   # 🚨 — immediate action needed
-        warning_alerts = []   # ⚠️  — close watch
+        breach_alerts  = []
+        warning_alerts = []
 
-        for pos in positions:
-            sym = pos["symbol"]
-            qty = pos["quantity"]
+        for leg in legs:
+            opt_type     = leg["type"]           # "put" or "call"
+            short_strike = float(leg["short_strike"])
+            entry_delta  = float(leg.get("entry_delta", 0.07))
 
-            # Determine option type from symbol (standard OCC format: ...C... or ...P...)
-            # OCC symbol: SPX + YYMMDD + C/P + 8-digit strike * 1000
-            opt_type = None
-            for i, ch in enumerate(sym):
-                if ch in ("C", "P") and i > 6:
-                    opt_type = ch.lower()
-                    break
-            if not opt_type:
-                log.warning(f"Cannot determine option type for {sym} — skipping")
-                continue
+            greeks = self.md.get_live_greeks_for_strike(
+                short_strike, opt_type, expiry, spx, vix
+            )
 
-            # Skip long legs (positive quantity = long; negative = short)
-            # Only short legs (qty < 0) carry breach risk
-            if qty > 0:
-                log.info(f"Long leg {sym} qty={qty} — no breach risk, skipping")
-                continue
+            live_delta  = abs(greeks["delta"])
+            live_gamma  = abs(greeks["gamma"])
+            mid         = greeks["mid"]
+            source      = greeks["source"]
+            label       = f"{int(short_strike)}{opt_type[0].upper()}"
 
-            # Fetch live greeks
-            greeks = self.md.get_live_greeks(sym, expiry)
-            if not greeks:
-                log.warning(f"Could not fetch greeks for {sym} — skipping leg")
-                warning_alerts.append(
-                    f"  ⚠️ {sym}: <b>greeks unavailable</b> — verify manually"
-                )
-                continue
+            log.info(f"{label} | Δ={live_delta:.3f} γ={live_gamma:.5f} "
+                     f"mid=${mid:.2f} [{source}]")
 
-            live_delta = abs(greeks["delta"])
-            live_gamma = abs(greeks["gamma"])
-            bid        = greeks["bid"]
-            ask        = greeks["ask"]
-            mid        = round((bid + ask) / 2, 2) if bid and ask else 0.0
-
-            log.info(f"{sym} | Δ={live_delta:.3f} γ={live_gamma:.4f} mid={mid}")
-
-            # ── Tier 1: Already breached ──────────────────────────────────────
-            if live_delta >= cfg.BREACH_DELTA:
-                breach_alerts.append(
-                    f"  🔴 <b>{sym}</b>  Δ=<b>{live_delta:.2f}</b>  "
-                    f"γ={live_gamma:.4f}  mid=${mid:.2f}\n"
-                    f"       DELTA ≥ {cfg.BREACH_DELTA} — CLOSE THIS LEG NOW"
-                )
-                continue
-
-            # ── Tier 2: Time-to-breach estimate ──────────────────────────────
-            # At current gamma, delta grows ~gamma per $1 SPX move.
-            # Using conservative SPX_1MIN_MOVE pts/min → minutes to breach.
+            # ── Time-to-breach estimate ───────────────────────────────────────
             if live_gamma > 0:
-                delta_headroom  = cfg.BREACH_DELTA - live_delta
-                dollars_to_hit  = delta_headroom / live_gamma
-                mins_to_breach  = dollars_to_hit / cfg.SPX_1MIN_MOVE
+                delta_headroom = cfg.BREACH_DELTA - live_delta
+                mins_to_breach = (delta_headroom / live_gamma) / cfg.SPX_1MIN_MOVE
             else:
                 mins_to_breach = 999.0
 
-            if mins_to_breach <= 15:
+            # ── Tier classification ───────────────────────────────────────────
+            already_breached = live_delta >= cfg.BREACH_DELTA
+            near_breach      = mins_to_breach <= cfg.MINS_BREACH_RED
+            early_warn       = live_delta >= cfg.BREACH_WARN_DELTA or \
+                               mins_to_breach <= cfg.MINS_BREACH_WARN
+
+            if already_breached:
                 breach_alerts.append(
-                    f"  🟠 <b>{sym}</b>  Δ=<b>{live_delta:.2f}</b>  "
-                    f"γ={live_gamma:.4f}  mid=${mid:.2f}\n"
-                    f"       ~<b>{mins_to_breach:.0f} min</b> to Δ{cfg.BREACH_DELTA} breach"
+                    f"  🔴 <b>{label}</b>  Δ=<b>{live_delta:.2f}</b>  "
+                    f"γ={live_gamma:.5f}  mid=${mid:.2f}  [{source}]\n"
+                    f"       DELTA ≥ {cfg.BREACH_DELTA} — CLOSE NOW"
                 )
-            elif live_delta >= cfg.BREACH_WARN_DELTA or mins_to_breach <= 30:
+            elif near_breach:
+                breach_alerts.append(
+                    f"  🟠 <b>{label}</b>  Δ=<b>{live_delta:.2f}</b>  "
+                    f"γ={live_gamma:.5f}  mid=${mid:.2f}  [{source}]\n"
+                    f"       ~<b>{mins_to_breach:.0f} min</b> to Δ{cfg.BREACH_DELTA}"
+                )
+            elif early_warn:
                 warning_alerts.append(
-                    f"  🟡 <b>{sym}</b>  Δ={live_delta:.2f}  "
-                    f"γ={live_gamma:.4f}  mid=${mid:.2f}  "
-                    f"~{mins_to_breach:.0f} min to breach"
+                    f"  🟡 <b>{label}</b>  Δ={live_delta:.2f}  "
+                    f"γ={live_gamma:.5f}  mid=${mid:.2f}  "
+                    f"~{mins_to_breach:.0f} min  [{source}]"
                 )
 
-        # ── Send alerts (breach takes priority) ──────────────────────────────
+        # ── Send (breach takes priority; silence if all clear) ────────────────
         if breach_alerts:
             self.tg.send(self.tg.monitor_breach_msg(breach_alerts, spx, time_str))
         elif warning_alerts:
             self.tg.send(self.tg.monitor_warn_msg(warning_alerts, spx, time_str))
         else:
-            log.info(f"All {len(positions)} legs within safe thresholds — no alert sent")
+            log.info(f"All {len(legs)} legs within safe thresholds — no alert sent")
 
     def run_test(self):
-        """Complete cycle ignoring time guards — for manual testing."""
         log.info("=== TEST RUN (time guards bypassed) ===")
         market = self.md.get_spx_vix()
         spx    = market.get("spx") or 5500.0
@@ -887,29 +913,32 @@ class BICSystem:
             )
             return
 
+        # Test also writes positions.json so monitor can be tested immediately after
+        save_positions(trade, 1)
+
         verdict = self.ai.analyze_trade(market, gex, trade, 1)
         msg     = "<b>[TEST RUN — not a live recommendation]</b>\n" + \
                   self.tg.trade_msg(market, gex, trade, verdict, 1)
         self.tg.send(msg)
-        log.info("Test complete — check Telegram")
+        log.info("Test complete — positions.json written, run --monitor to verify")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="BIC 0DTE SPX Alert System v3.1")
+    parser = argparse.ArgumentParser(description="BIC 0DTE SPX Alert System v3.2")
     group  = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--morning", action="store_true",   help="Morning regime scan")
     group.add_argument("--entry",   type=int, metavar="N", help="Entry scan #N (1-5)")
-    group.add_argument("--exit",    action="store_true",   help="Exit reminder")
+    group.add_argument("--exit",    action="store_true",   help="Exit reminder + clear positions")
     group.add_argument("--monitor", action="store_true",   help="Leg breach monitor (runs every ~12 min)")
     group.add_argument("--test",    action="store_true",   help="Test run (bypasses time guards)")
     args = parser.parse_args()
 
     sys = BICSystem()
-    if   args.morning:             sys.run_morning()
-    elif args.entry is not None:   sys.run_entry(args.entry)
-    elif args.exit:                sys.run_exit()
-    elif args.monitor:             sys.run_monitor()
-    elif args.test:                sys.run_test()
+    if   args.morning:           sys.run_morning()
+    elif args.entry is not None: sys.run_entry(args.entry)
+    elif args.exit:              sys.run_exit()
+    elif args.monitor:           sys.run_monitor()
+    elif args.test:              sys.run_test()
