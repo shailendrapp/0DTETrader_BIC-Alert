@@ -1,0 +1,144 @@
+name: BIC 0DTE SPX Alerts
+
+on:
+  schedule:
+    - cron: '30 14 * * 1-5'           # 06:30 PST — morning
+    - cron: '35 15 * * 1-5'           # 07:35 PST — entry #1
+    - cron: '35 16 * * 1-5'           # 08:35 PST — entry #2
+    - cron: '35 17 * * 1-5'           # 09:35 PST — entry #3
+    - cron: '35 18 * * 1-5'           # 10:35 PST — entry #4
+    - cron: '35 19 * * 1-5'           # 11:35 PST — entry #5
+    - cron: '30 22 * * 1-5'           # 14:30 PST — exit reminder
+    # Leg monitor: every 12 min, 07:30–14:30 PST (15:30–22:30 UTC)
+    # 12-min cadence absorbs GitHub's ~5 min scheduler drift
+    - cron: '0,12,24,36,48 15-22 * * 1-5'
+
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Run mode'
+        required: true
+        default: 'test'
+        type: choice
+        options: [test, morning, entry1, entry2, entry3, entry4, entry5, exit, monitor]
+
+jobs:
+  bic-alert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    concurrency:
+      group: bic-alert-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run BIC alert
+        env:
+          TRADIER_API_KEY:    ${{ secrets.TRADIER_API_KEY }}
+          FLASHALPHA_API_KEY: ${{ secrets.FLASHALPHA_API_KEY }}
+          ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_MODE:           ${{ github.event.inputs.mode }}
+          EVENT_NAME:         ${{ github.event_name }}
+        run: |
+          echo "UTC: $(date -u '+%H:%M')"
+          echo "ET:  $(TZ='America/New_York' date '+%H:%M')"
+          echo "Event: $EVENT_NAME"
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "Manual mode: $RUN_MODE"
+            case "$RUN_MODE" in
+              test)    python bic_0dte_spx.py --test    ;;
+              morning) python bic_0dte_spx.py --morning ;;
+              entry1)  python bic_0dte_spx.py --entry 1 ;;
+              entry2)  python bic_0dte_spx.py --entry 2 ;;
+              entry3)  python bic_0dte_spx.py --entry 3 ;;
+              entry4)  python bic_0dte_spx.py --entry 4 ;;
+              entry5)  python bic_0dte_spx.py --entry 5 ;;
+              exit)    python bic_0dte_spx.py --exit    ;;
+              monitor) python bic_0dte_spx.py --monitor ;;
+            esac
+          else
+            CRON_HOUR=$(date -u +%H)
+            CRON_MIN=$(date -u +%M)
+            echo "Scheduled: HOUR=$CRON_HOUR MIN=$CRON_MIN"
+
+            if   [ "$CRON_HOUR" = "14" ] || ([ "$CRON_HOUR" = "15" ] && [ "$CRON_MIN" -lt "35" ]); then
+              echo "Running: morning"
+              python bic_0dte_spx.py --morning
+            elif [ "$CRON_HOUR" = "15" ]; then
+              echo "Running: entry 1"
+              python bic_0dte_spx.py --entry 1
+            elif [ "$CRON_HOUR" = "16" ]; then
+              echo "Running: entry 2"
+              python bic_0dte_spx.py --entry 2
+            elif [ "$CRON_HOUR" = "17" ]; then
+              echo "Running: entry 3"
+              python bic_0dte_spx.py --entry 3
+            elif [ "$CRON_HOUR" = "18" ]; then
+              echo "Running: entry 4"
+              python bic_0dte_spx.py --entry 4
+            elif [ "$CRON_HOUR" = "19" ]; then
+              echo "Running: entry 5"
+              python bic_0dte_spx.py --entry 5
+            elif [ "$CRON_HOUR" = "22" ]; then
+              echo "Running: exit"
+              python bic_0dte_spx.py --exit
+            else
+              echo "No action for UTC $CRON_HOUR:$CRON_MIN — skipping"
+            fi
+          fi
+
+  leg-monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Only run on schedule (not manual dispatch — use bic-alert job with mode=monitor for that)
+    if: github.event_name == 'schedule'
+    concurrency:
+      group: leg-monitor-${{ github.ref }}
+      cancel-in-progress: true      # if a prior monitor run is still going, skip it
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Monitor open legs for breach
+        env:
+          TRADIER_API_KEY:    ${{ secrets.TRADIER_API_KEY }}
+          ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          echo "UTC: $(date -u '+%H:%M')"
+          echo "ET:  $(TZ='America/New_York' date '+%H:%M')"
+          CRON_HOUR=$(date -u +%H)
+          # Only run monitor during active trading hours (15–22 UTC = 07:00–14:30 PST)
+          if [ "$CRON_HOUR" -ge "15" ] && [ "$CRON_HOUR" -le "22" ]; then
+            echo "Running: leg monitor"
+            python bic_0dte_spx.py --monitor
+          else
+            echo "Outside trading hours (UTC $CRON_HOUR) — skipping monitor"
+          fi
+
+  keep-alive:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Keep repo active
+        run: |
+          git config user.email "action@github.com"
+          git config user.name "GitHub Action"
+          git commit --allow-empty -m "chore: keep-alive [skip ci]"
+          git push
