@@ -8,7 +8,7 @@
       "short_strike": 7310.0,
       "long_strike": 7285.0,
       "entry_delta": 0.072,
-      "entry_credit": 208
+      "entry_credit": 212
     },
     {
       "type": "call",
