@@ -1,5 +1,21 @@
 {
-  "date": "2026-07-03",
-  "legs": [],
-  "cleared": "exit"
+  "date": "2026-07-06",
+  "entry_num": 3,
+  "expiry": "2026-07-06",
+  "legs": [
+    {
+      "type": "put",
+      "short_strike": 7505,
+      "long_strike": 7480,
+      "entry_delta": 0.071,
+      "entry_credit": 65
+    },
+    {
+      "type": "call",
+      "short_strike": 7565,
+      "long_strike": 7590,
+      "entry_delta": 0.092,
+      "entry_credit": 87
+    }
+  ]
 }
