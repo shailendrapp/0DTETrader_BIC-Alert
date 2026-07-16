@@ -5,17 +5,17 @@
   "legs": [
     {
       "type": "put",
-      "short_strike": 7510,
-      "long_strike": 7485,
-      "entry_delta": 0.08,
-      "entry_credit": 86
+      "short_strike": 7515,
+      "long_strike": 7490,
+      "entry_delta": 0.084,
+      "entry_credit": 87
     },
     {
       "type": "call",
       "short_strike": 7580,
       "long_strike": 7605,
-      "entry_delta": 0.096,
-      "entry_credit": 106
+      "entry_delta": 0.098,
+      "entry_credit": 104
     }
   ]
 }
